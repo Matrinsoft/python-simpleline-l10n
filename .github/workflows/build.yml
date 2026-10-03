@@ -1,0 +1,72 @@
+name: Build package and publish release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_NAME: python-simpleline-l10n
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build package in Fedora container
+        run: |
+          mkdir -p artifact-out
+          docker run --rm \
+            -v "$PWD:/src" \
+            -v "$PWD/artifact-out:/out" \
+            -w /src \
+            registry.fedoraproject.org/fedora:45 bash -c '
+              set -euo pipefail
+              dnf install -y -q --setopt=install_weak_deps=False \
+                rpm-build rpmdevtools dnf-plugins-core make git tar gzip xz findutils
+              SPEC="$(find . -maxdepth 3 -type f -name "*.spec" | head -1 || true)"
+              if [ -n "$SPEC" ]; then
+                rpmdev-setuptree
+                SPEC_DIR="$(dirname "$SPEC")"
+                cp "$SPEC" ~/rpmbuild/SPECS/
+                find "$SPEC_DIR" -maxdepth 1 -type f \
+                  ! -name "*.spec" -exec cp {} ~/rpmbuild/SOURCES/ \; \
+                  2>/dev/null || true
+                SPEC_NAME="$(basename "$SPEC")"
+                dnf builddep -y -q --setopt=minrate=0 --setopt=timeout=60 --setopt=retries=10 \
+                  "$SPEC" || true
+                rpmbuild -ba --nocheck "$HOME/rpmbuild/SPECS/$SPEC_NAME"
+                find ~/rpmbuild/RPMS ~/rpmbuild/SRPMS -type f -name "*.rpm" -exec cp {} /out/ \; \
+                  2>/dev/null || true
+              fi
+              if ! find /out -type f -name "*.rpm" -print -quit | grep -q .; then
+                tar czf "/out/python-simpleline-l10n-${GITHUB_SHA}.tar.gz" \
+                  --exclude=.git --exclude=artifact-out .
+              fi
+              ls -la /out
+            '
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="ci-${GITHUB_SHA::12}"
+          shopt -s nullglob
+          artifacts=(artifact-out/*)
+          if [ ${#artifacts[@]} -eq 0 ]; then
+            echo "No build artifacts produced"
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${artifacts[@]}" --clobber
+          else
+            gh release create "$TAG" "${artifacts[@]}" --generate-notes
+          fi
+          echo "Published release $TAG"
